@@ -72,6 +72,103 @@ from typing import AsyncGenerator
 from core.llm import get_llm, BaseLLM, DEFAULT_RAG_PROMPT
 from retrieval.searcher import search, format_results_as_context, SearchResult
 
+# ── Conversation history compression ─────────────────────────────────────────
+# Keep the last KEEP_RECENT messages verbatim; when the window exceeds
+# KEEP_RECENT + SUMMARISE_EVERY, compress the oldest batch into a running
+# summary. Token cost stays flat regardless of conversation length.
+
+KEEP_RECENT     = 20
+SUMMARISE_EVERY = 10
+
+SUMMARISE_PROMPT = """Summarise this conversation history concisely in 3-5 sentences.
+Capture: the document or topic being discussed, key facts and numbers established,
+specific questions that were answered, and important details mentioned.
+Be specific — include names, numbers, and terms that came up.
+Return only the summary paragraph, no preamble."""
+
+
+async def _build_summary(messages: list[dict]) -> str:
+    llm = get_llm()
+    history_text = "\n".join(
+        f"{m['role'].capitalize()}: {m['content'][:300]}"
+        for m in messages
+    )
+    return await llm.generate_answer(
+        question=history_text,
+        context="",
+        system_prompt=SUMMARISE_PROMPT,
+    )
+
+
+async def maybe_compress_history(conversation_id: str) -> None:
+    """
+    Called as a background task after every message save.
+    When total messages exceed KEEP_RECENT + SUMMARISE_EVERY,
+    compress the oldest SUMMARISE_EVERY messages into history_summary.
+    Only triggers on exact multiples to avoid running on every message.
+    """
+    from db.database import (
+        get_messages, get_history_summary,
+        update_history_summary, count_messages,
+    )
+    total = await count_messages(conversation_id)
+    if total <= KEEP_RECENT + SUMMARISE_EVERY:
+        return
+    if (total - KEEP_RECENT) % SUMMARISE_EVERY != 0:
+        return
+
+    all_messages = await get_messages(conversation_id)
+    old_messages = all_messages[:SUMMARISE_EVERY]
+    existing_summary = await get_history_summary(conversation_id)
+
+    if existing_summary:
+        merge_input = (
+            f"Existing summary:\n{existing_summary}\n\n"
+            "New messages to incorporate:\n"
+            + "\n".join(
+                f"{m['role'].capitalize()}: {m['content'][:300]}"
+                for m in old_messages
+            )
+        )
+        llm = get_llm()
+        new_summary = await llm.generate_answer(
+            question=merge_input,
+            context="",
+            system_prompt=(
+                "Update the summary to include the new messages. "
+                "Keep it to 4-6 sentences. Be specific about facts and names. "
+                "Return only the updated summary paragraph."
+            ),
+        )
+    else:
+        new_summary = await _build_summary(old_messages)
+
+    await update_history_summary(conversation_id, new_summary)
+
+
+async def get_effective_history(conversation_id: str) -> list[dict]:
+    """
+    Returns what the LLM receives as conversation context:
+    - Running summary as a synthetic assistant message (if exists)
+    - Last KEEP_RECENT messages verbatim
+    Token cost stays flat regardless of conversation length.
+    """
+    from db.database import get_messages, get_history_summary
+    summary = await get_history_summary(conversation_id)
+    all_messages = await get_messages(conversation_id)
+    recent = all_messages[-KEEP_RECENT:]
+    effective: list[dict] = []
+    if summary:
+        effective.append({
+            "role": "assistant",
+            "content": f"[Summary of earlier conversation: {summary}]",
+        })
+    effective.extend(
+        {"role": m["role"], "content": m["content"]}
+        for m in recent
+    )
+    return effective
+
 
 async def generate_answer(
     question: str,
@@ -151,6 +248,7 @@ async def generate_answer(
 async def generate_answer_full(
     question: str,
     file_id: str | None = None,
+    file_ids: list[str] | None = None,
     sheet_name: str | None = None,
     chat_history: list[dict] | None = None,
 ) -> dict:
@@ -173,10 +271,10 @@ async def generate_answer_full(
     - API clients that don't support streaming
     - Logging: you want to log complete answers for debugging
     """
-    # Get search results first (we need them for source metadata)
     results = await search(
         query=question,
         file_id=file_id,
+        file_ids=file_ids,
         sheet_name=sheet_name,
     )
 

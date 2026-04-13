@@ -110,14 +110,30 @@ class Settings(BaseSettings):
 
     top_k: int = 5
 
-    # ── ChromaDB settings ──────────────────────────────────────────────
-    # persist_directory: where ChromaDB saves vectors to disk.
-    #   - Vectors survive server restarts (no re-embedding on reboot)
-    #   - In production, this would be a cloud-hosted vector DB instead
+    # ── Qdrant vector store ───────────────────────────────────────────
+    # Remote server (Docker: docker run -p 6333:6333 qdrant/qdrant) or
+    # qdrant_use_memory=True for in-process :memory: (dev only, no persistence).
 
-    chroma_persist_dir: Path = Path("./data/chroma")
+    qdrant_url: str = "http://localhost:6333"
+    qdrant_use_memory: bool = False
+
+    # ── Web search ───────────────────────────────────────────────────
+    # SearXNG self-hosted (primary, free, unlimited).
+    # Docker: docker run -d -p 8080:8080 \
+    #   -v ./searxng-settings.yml:/etc/searxng/settings.yml:ro \
+    #   searxng/searxng
+    # settings.yml must include: search.formats: [html, json]
+    # Leave empty to skip SearXNG. DuckDuckGo is always the free fallback.
+    searxng_url: str = "http://localhost:8080"
+
+    # Brave Search API fallback (free tier: 2,000 req/month, no card).
+    # Get key at: https://brave.com/search/api/
+    # Leave empty to skip Brave (DDG instant answer is always the last resort).
+    brave_api_key: str = ""
+
+    database_url: str = "postgresql://raguser:ragpassword@localhost:5432/ragdb"
+
     bm25_dir: Path = Path("./data/bm25")
-    db_path: Path = Path("./data/rag.db")
 
     # ── Reranker ───────────────────────────────────────────────────────
     enable_reranker: bool = True
@@ -126,18 +142,25 @@ class Settings(BaseSettings):
     # ── Vision / multimodal ────────────────────────────────────────────
     # enable_vision: set True to describe PDF screenshots with a vision LLM.
     # vision_provider: which provider handles image description.
+    #   "grok"    → grok-2-vision (needs GROK_API_KEY, uses xAI's OpenAI-compat API)
     #   "openai"  → gpt-4o-mini (needs OPENAI_API_KEY)
     #   "ollama"  → any local multimodal model (e.g. qwen3:latest)
     #   "none"    → skip image description, text + tables only
 
     enable_vision: bool = False
-    vision_provider: Literal["openai", "ollama", "none"] = "none"
+    vision_provider: Literal["openai", "ollama", "groq", "grok", "none"] = "none"
+    grok_vision_model: str = "grok-2-vision-1212"
 
     # ── Ollama (local or cloud) ────────────────────────────────────────
     ollama_base_url: str = "http://localhost:11434"
-    ollama_llm_model: str = "qwen3:latest"
+    ollama_llm_model: str = "qwen3.5:cloud"
     ollama_vision_model: str = "qwen3:latest"
     ollama_api_key: str = "ollama"
+
+    # ── JWT / Auth ─────────────────────────────────────────────────────
+    jwt_secret_key: str = "change-this-in-production-use-32-chars-min"
+    jwt_algorithm: str = "HS256"
+    jwt_expire_minutes: int = 480   # 8 hours
 
     # ── File upload settings ───────────────────────────────────────────
     upload_dir: Path = Path("./data/uploads")

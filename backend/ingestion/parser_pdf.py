@@ -99,7 +99,68 @@ async def _describe_image(img_bytes: bytes, page_label: str) -> str | None:
         return None
 
     try:
-        if settings.vision_provider == "ollama":
+        if settings.vision_provider == "openai":
+            import base64 as _b64
+            from openai import AsyncOpenAI
+            b64        = _b64.b64encode(img_bytes).decode()
+            media_type = "image/jpeg" if img_bytes[:3] == b'\xff\xd8\xff' else "image/png"
+            client     = AsyncOpenAI(api_key=settings.openai_api_key)
+            response   = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    max_tokens=400,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{b64}", "detail": "low"}},
+                            {"type": "text",      "text": _VISION_PROMPT.format(page_label=page_label)},
+                        ],
+                    }],
+                ),
+                timeout=20,
+            )
+            return response.choices[0].message.content
+
+        elif settings.vision_provider == "grok":
+            import base64 as _b64
+            from openai import AsyncOpenAI
+            b64 = _b64.b64encode(img_bytes).decode()
+            media_type = (
+                "image/jpeg"
+                if img_bytes[:3] == b'\xff\xd8\xff'
+                else "image/png"
+            )
+            client = AsyncOpenAI(
+                api_key=settings.grok_api_key,
+                base_url=settings.grok_base_url,
+            )
+            response = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=settings.grok_vision_model,
+                    max_tokens=400,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{media_type};base64,{b64}",
+                                },
+                            },
+                            {
+                                "type": "text",
+                                "text": _VISION_PROMPT.format(
+                                    page_label=page_label
+                                ),
+                            },
+                        ],
+                    }],
+                ),
+                timeout=20,
+            )
+            return response.choices[0].message.content
+
+        elif settings.vision_provider == "ollama":
             from ollama import AsyncClient
             client   = AsyncClient(host=settings.ollama_base_url)
             response = await asyncio.wait_for(
@@ -108,31 +169,12 @@ async def _describe_image(img_bytes: bytes, page_label: str) -> str | None:
                     messages=[{
                         "role":    "user",
                         "content": _VISION_PROMPT.format(page_label=page_label),
-                        "images":  [img_bytes],   # SDK accepts raw bytes directly
+                        "images":  [img_bytes],
                     }],
                 ),
-                timeout=8,
+                timeout=20,
             )
             return response.message.content
-
-        elif settings.vision_provider == "openai":
-            import base64 as _b64
-            from openai import AsyncOpenAI
-            b64        = _b64.b64encode(img_bytes).decode()
-            media_type = "image/jpeg" if img_bytes[:3] == b'\xff\xd8\xff' else "image/png"
-            client     = AsyncOpenAI(api_key=settings.openai_api_key)
-            response   = await client.chat.completions.create(
-                model="gpt-4o-mini",
-                max_tokens=400,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{b64}", "detail": "low"}},
-                        {"type": "text",      "text": _VISION_PROMPT.format(page_label=page_label)},
-                    ],
-                }],
-            )
-            return response.choices[0].message.content
 
         return None
 

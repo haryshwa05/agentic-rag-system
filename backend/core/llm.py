@@ -525,14 +525,68 @@ class OllamaLLM(BaseLLM):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Fallback wrapper — primary LLM → Qwen (Ollama) on any error
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+class FallbackLLM(BaseLLM):
+    """
+    Wraps a primary LLM with automatic fallback to Qwen via Ollama.
+
+    If the primary provider raises any exception (quota, auth, network),
+    all LLM operations — RAG answers, web search synthesis, chart generation,
+    auto-title, history compression — transparently retry with Qwen.
+
+    For streaming: if the primary fails before yielding a single token
+    (the common case for 403/quota errors), we switch to the fallback cleanly.
+    If it fails mid-stream, we emit a brief notice and continue from fallback.
+    """
+
+    def __init__(self, primary: BaseLLM, fallback: BaseLLM):
+        self.primary = primary
+        self.fallback = fallback
+
+    async def stream_answer(
+        self,
+        question: str,
+        context: str,
+        system_prompt: str | None = None,
+    ) -> AsyncGenerator[str, None]:
+        yielded = 0
+        try:
+            async for token in self.primary.stream_answer(question, context, system_prompt):
+                yielded += 1
+                yield token
+        except Exception as e:
+            print(f"[llm_fallback] Primary LLM failed ({type(e).__name__}: {e}). Using Qwen fallback.")
+            if yielded > 0:
+                yield "\n\n*(switched to fallback model)*\n\n"
+            async for token in self.fallback.stream_answer(question, context, system_prompt):
+                yield token
+
+    async def generate_answer(
+        self,
+        question: str,
+        context: str,
+        system_prompt: str | None = None,
+    ) -> str:
+        try:
+            return await self.primary.generate_answer(question, context, system_prompt)
+        except Exception as e:
+            print(f"[llm_fallback] Primary LLM failed ({type(e).__name__}: {e}). Using Qwen fallback.")
+            return await self.fallback.generate_answer(question, context, system_prompt)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Factory function
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
 def get_llm() -> BaseLLM:
     """
-    Returns the right LLM based on the LLM_PROVIDER setting.
-    Change LLM_PROVIDER in .env → entire app uses a different LLM.
+    Returns the configured LLM wrapped in a FallbackLLM that retries
+    with Qwen (Ollama) on any error.
+    Change LLM_PROVIDER in .env to swap the primary provider.
     """
     providers = {
         "openai":     OpenAILLM,
@@ -541,15 +595,26 @@ def get_llm() -> BaseLLM:
         "gemini":     GeminiLLM,
         "groq":       GroqLLM,
         "ollama":     OllamaLLM,
-        "local":      OllamaLLM,   # "local" now maps to Ollama
+        "local":      OllamaLLM,
     }
 
     provider_class = providers.get(settings.llm_provider)
-
     if provider_class is None:
         raise ValueError(
             f"Unknown LLM provider: '{settings.llm_provider}'. "
             f"Must be one of: {list(providers.keys())}"
         )
 
-    return provider_class()
+    primary = provider_class()
+
+    # If the primary IS already Ollama/Qwen, no need to wrap it
+    if isinstance(primary, OllamaLLM):
+        return primary
+
+    try:
+        fallback = OllamaLLM()
+    except Exception as e:
+        print(f"[llm_fallback] Could not initialise Qwen fallback ({e}). Running without fallback.")
+        return primary
+
+    return FallbackLLM(primary=primary, fallback=fallback)

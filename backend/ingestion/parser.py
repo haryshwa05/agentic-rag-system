@@ -77,6 +77,52 @@ def _parse_excel(file_path: Path, file_id: str) -> list[Chunk]:
 
 # ── PDF ───────────────────────────────────────────────────────────
 
+def _text_to_chunks(
+    text: str,
+    file_id: str,
+    file_name: str,
+    page_label: str,
+    page_num: int,
+    all_chunks: list,
+) -> None:
+    """Split a page's raw text into paragraph-grouped Chunk objects."""
+    text = text.strip()
+    if len(text) < 30:
+        return
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if not paragraphs:
+        paragraphs = [line.strip() for line in text.split("\n") if line.strip()]
+    target = 800
+    buf: list[str] = []
+    buf_len = 0
+
+    def _flush_buf() -> None:
+        nonlocal buf, buf_len
+        if not buf:
+            return
+        all_chunks.append(Chunk(
+            text=f"[PDF Text — {file_name} | {page_label}]\n\n" + "\n\n".join(buf),
+            metadata={
+                "file_id": file_id,
+                "file_name": file_name,
+                "sheet_name": f"{page_label} text",
+                "row_start": page_num + 1,
+                "row_end": page_num + 1,
+                "column_names": "text",
+                "num_rows": 1,
+            },
+        ))
+        buf = []
+        buf_len = 0
+
+    for para in paragraphs:
+        if buf_len + len(para) > target and buf:
+            _flush_buf()
+        buf.append(para)
+        buf_len += len(para)
+    _flush_buf()
+
+
 def _parse_pdf(file_path: Path, file_id: str) -> list[Chunk]:
     try:
         import pdfplumber
@@ -111,44 +157,55 @@ def _parse_pdf(file_path: Path, file_id: str) -> list[Chunk]:
 
                 df = pd.DataFrame(rows, columns=headers)
                 all_chunks.extend(
-                    _dataframe_to_chunks(df, headers, file_id, file_path.name, f"{page_label} Table {table_idx + 1}", 0)
+                    _dataframe_to_chunks(
+                        df, headers, file_id, file_path.name,
+                        f"{page_label} Table {table_idx + 1}", 0,
+                    )
                 )
 
-            # Free text → paragraph chunks
+            # Free text → paragraph chunks (threshold lowered to 30 chars)
             text = (page.extract_text() or "").strip()
-            if len(text) > 80:
-                paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-                buf: list[str] = []
-                buf_len = 0
-                target = 800
+            _text_to_chunks(text, file_id, file_path.name, page_label, page_num, all_chunks)
 
-                def _flush():
-                    nonlocal buf, buf_len
-                    if not buf:
-                        return
-                    block = "\n\n".join(buf)
-                    all_chunks.append(Chunk(
-                        text=f"[PDF Text — {file_path.name} | {page_label}]\n\n{block}",
-                        metadata={
-                            "file_id": file_id,
-                            "file_name": file_path.name,
-                            "sheet_name": f"{page_label} text",
-                            "row_start": page_num + 1,
-                            "row_end": page_num + 1,
-                            "column_names": "text",
-                            "num_rows": 1,
-                        },
-                    ))
-                    buf = []
-                    buf_len = 0
+    # ── PyMuPDF fallback ──────────────────────────────────────────────
+    # If pdfplumber found nothing (e.g., scanned PDF with embedded fonts
+    # that need a different renderer), try PyMuPDF which uses a different
+    # text extraction engine and often succeeds where pdfplumber fails.
+    if not all_chunks:
+        all_chunks = _parse_pdf_pymupdf_fallback(file_path, file_id)
 
-                for para in paragraphs:
-                    if buf_len + len(para) > target and buf:
-                        _flush()
-                    buf.append(para)
-                    buf_len += len(para)
+    return all_chunks
 
-                _flush()
+
+def _parse_pdf_pymupdf_fallback(file_path: Path, file_id: str) -> list[Chunk]:
+    """
+    Secondary PDF text extractor using PyMuPDF (fitz).
+    Used when pdfplumber extracts nothing — different rendering engine,
+    handles more font/encoding edge cases.
+    """
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return []
+
+    all_chunks: list[Chunk] = []
+    try:
+        doc = fitz.open(str(file_path))
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            page_label = f"Page {page_num + 1}"
+            text = page.get_text("text")  # type: ignore[attr-defined]
+            _text_to_chunks(
+                text, file_id, file_path.name, page_label, page_num, all_chunks
+            )
+        doc.close()
+    except Exception as e:
+        # Surface the exception so the pipeline can report it clearly
+        raise RuntimeError(
+            f"PDF text extraction failed for '{file_path.name}': {e}. "
+            "The file may be a scanned image-only PDF with no embedded text. "
+            "Enable vision mode (ENABLE_VISION=true) to process image-based PDFs."
+        ) from e
 
     return all_chunks
 
