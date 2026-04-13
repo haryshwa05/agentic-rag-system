@@ -13,7 +13,12 @@ from dataclasses import dataclass
 
 from core.config import settings
 from core.embedder import get_embedder
-from db.chroma_client import get_collection, get_all_collections
+from db.qdrant_client import (
+    collection_count,
+    get_collection_documents,
+    list_collections,
+    search_collection,
+)
 from retrieval import bm25_index
 from retrieval import reranker as reranker_module
 
@@ -29,6 +34,7 @@ class SearchResult:
 async def search(
     query: str,
     file_id: str | None = None,
+    file_ids: list[str] | None = None,
     sheet_name: str | None = None,
     top_k: int | None = None,
 ) -> list[SearchResult]:
@@ -40,10 +46,15 @@ async def search(
 
     if file_id:
         semantic = _semantic_search(file_id, query_embedding, sheet_name, top_k=top_k * 2)
-        keyword  = _bm25_search(file_id, query, top_k=top_k)
-        merged   = _merge(semantic, keyword, limit=top_k * 2)
-        final    = await reranker_module.rerank(query, merged, top_k)
+        keyword = _bm25_search(file_id, query, top_k=top_k)
+        merged = _merge(semantic, keyword, limit=top_k * 2)
+        if settings.enable_reranker:
+            final = await reranker_module.rerank(query, merged, top_k)
+        else:
+            final = merged[:top_k]
         return _inject_summary(final, file_id)
+    elif file_ids:
+        return await _search_multiple(query_embedding, query, file_ids, sheet_name, top_k)
     else:
         return await _search_all(query_embedding, sheet_name, top_k)
 
@@ -56,18 +67,17 @@ def _semantic_search(
     sheet_name: str | None,
     top_k: int,
 ) -> list[SearchResult]:
-    try:
-        collection = get_collection(file_id)
-    except Exception:
+    cnt = collection_count(file_id)
+    if cnt == 0:
         return []
 
     where = {"sheet_name": sheet_name} if sheet_name else None
     try:
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=min(top_k, collection.count()),
+        results = search_collection(
+            file_id=file_id,
+            query_embedding=query_embedding,
+            n_results=min(top_k, cnt),
             where=where,
-            include=["documents", "metadatas", "distances"],
         )
     except Exception:
         return []
@@ -112,12 +122,12 @@ def _inject_summary(results: list[SearchResult], file_id: str) -> list[SearchRes
     if any(r.metadata.get("sheet_name") == "summary" for r in results):
         return results
     try:
-        collection = get_collection(file_id)
-        summary = collection.get(
+        summary = get_collection_documents(
+            file_id,
             where={"sheet_name": "summary"},
             include=["documents", "metadatas"],
         )
-        if summary["ids"]:
+        if summary.get("ids"):
             return [
                 SearchResult(
                     text=summary["documents"][0],
@@ -131,21 +141,48 @@ def _inject_summary(results: list[SearchResult], file_id: str) -> list[SearchRes
     return results
 
 
+async def _search_multiple(
+    query_embedding: list[float],
+    query: str,
+    file_ids: list[str],
+    sheet_name: str | None,
+    top_k: int,
+) -> list[SearchResult]:
+    """Search across a specific set of files (agent-scoped retrieval)."""
+    all_results: list[SearchResult] = []
+    per_file_k = max(top_k, top_k * 2 // len(file_ids))
+    for fid in file_ids:
+        cnt = collection_count(fid)
+        if cnt == 0:
+            continue
+        semantic = _semantic_search(fid, query_embedding, sheet_name, top_k=per_file_k)
+        keyword = _bm25_search(fid, query, top_k=per_file_k)
+        merged = _merge(semantic, keyword, limit=per_file_k)
+        all_results.extend(merged)
+    all_results.sort(key=lambda r: r.score, reverse=True)
+    if settings.enable_reranker and all_results:
+        return await reranker_module.rerank(query, all_results, top_k)
+    return all_results[:top_k]
+
+
 async def _search_all(
     query_embedding: list[float],
     sheet_name: str | None,
     top_k: int,
 ) -> list[SearchResult]:
     all_results: list[SearchResult] = []
-    for collection in get_all_collections():
-        file_id = collection.name.replace("file_", "", 1)
+    for name in list_collections():
+        file_id = name.replace("file_", "", 1)
+        cnt = collection_count(file_id)
+        if cnt == 0:
+            continue
         where = {"sheet_name": sheet_name} if sheet_name else None
         try:
-            results = collection.query(
-                query_embeddings=[query_embedding],
-                n_results=min(top_k, collection.count()),
+            results = search_collection(
+                file_id=file_id,
+                query_embedding=query_embedding,
+                n_results=min(top_k, cnt),
                 where=where,
-                include=["documents", "metadatas", "distances"],
             )
             all_results.extend(_parse_results(results, file_id))
         except Exception:
@@ -177,11 +214,11 @@ def format_results_as_context(results: list[SearchResult]) -> str:
         return "No relevant data found."
     parts = []
     for r in results:
-        meta   = r.metadata
+        meta = r.metadata
         source = meta.get("file_name", "unknown")
-        sheet  = meta.get("sheet_name", "default")
-        r_s    = meta.get("row_start", "?")
-        r_e    = meta.get("row_end", "?")
+        sheet = meta.get("sheet_name", "default")
+        r_s = meta.get("row_start", "?")
+        r_e = meta.get("row_end", "?")
         header = (
             f"--- Source: {source} | Section: {sheet} | "
             f"Rows: {r_s}-{r_e} (relevance: {r.score:.2f}) ---"
